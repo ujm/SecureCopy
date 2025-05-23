@@ -24,7 +24,7 @@ A flexible and powerful backup solution for Windows and Linux systems. Supports 
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/backup-tool.git
+   git clone https://github.com/ujm/SecureCopy.git
    cd backup-tool
    ```
 
@@ -124,7 +124,7 @@ MIT License
 
 1. このリポジトリをクローン：
    ```bash
-   git clone https://github.com/yourusername/backup-tool.git
+   git clone https://github.com/ujm/SecureCopy.git
    cd backup-tool
    ```
 
