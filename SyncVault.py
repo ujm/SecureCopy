@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-クロスプラットフォームバックアッププログラム
+クロスプラットフォームバックアッププログラム（並列処理対応版）
 Windows および Linux 環境で動作するバックアッププログラム
 """
 
@@ -20,6 +20,17 @@ import platform
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from queue import Queue
+import threading
+
+# プログレスバー表示用（オプション）
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 # ロギング設定
 logging.basicConfig(
@@ -35,6 +46,41 @@ logger = logging.getLogger("backup")
 # 設定ファイルのデフォルトパス
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.backup_config.json")
 
+# 並列処理の設定
+DEFAULT_MAX_WORKERS = min(32, (os.cpu_count() or 1) * 2)
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+
+class FileProcessor:
+    """ファイル処理用のヘルパークラス"""
+    
+    def __init__(self, temp_dir: str, source_base_paths: List[str]):
+        self.temp_dir = temp_dir
+        self.source_base_paths = source_base_paths
+        self.processed_count = 0
+        self.skipped_count = 0
+        self.error_count = 0
+        self.total_size = 0
+        self.lock = Lock()
+        
+    def update_stats(self, processed: int = 0, skipped: int = 0, 
+                    error: int = 0, size: int = 0):
+        """統計情報を更新する（スレッドセーフ）"""
+        with self.lock:
+            self.processed_count += processed
+            self.skipped_count += skipped
+            self.error_count += error
+            self.total_size += size
+            
+    def get_stats(self) -> Dict[str, int]:
+        """統計情報を取得する"""
+        with self.lock:
+            return {
+                "processed": self.processed_count,
+                "skipped": self.skipped_count,
+                "errors": self.error_count,
+                "total_size": self.total_size
+            }
+
 class BackupManager:
     """バックアップ処理を管理するクラス"""
     
@@ -46,6 +92,7 @@ class BackupManager:
         """
         self.config_path = config_path
         self.config = self._load_config()
+        self.max_workers = self.config.get("max_workers", DEFAULT_MAX_WORKERS)
         
     def _load_config(self) -> Dict[str, Any]:
         """設定ファイルを読み込む
@@ -67,7 +114,15 @@ class BackupManager:
                     "day_of_week": 0,  # 0 = 月曜日
                     "full_backup_day": 0  # 0 = 月曜日
                 },
-                "history": []
+                "history": [],
+                "max_workers": DEFAULT_MAX_WORKERS,  # 並列処理の最大ワーカー数
+                "exclude_patterns": [  # 除外パターン
+                    "*.tmp",
+                    "*.temp",
+                    "~*",
+                    "Thumbs.db",
+                    ".DS_Store"
+                ]
             }
             
             # デフォルト設定を保存
@@ -79,7 +134,13 @@ class BackupManager:
         # 既存の設定ファイルを読み込む
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+                # 新しい設定項目がない場合はデフォルト値を追加
+                if "max_workers" not in config:
+                    config["max_workers"] = DEFAULT_MAX_WORKERS
+                if "exclude_patterns" not in config:
+                    config["exclude_patterns"] = ["*.tmp", "*.temp", "~*", "Thumbs.db", ".DS_Store"]
+                return config
         except json.JSONDecodeError:
             logger.error("設定ファイルの形式が不正です")
             return {}
@@ -163,6 +224,20 @@ class BackupManager:
         self._save_config()
         logger.info(f"圧縮設定を更新しました: 圧縮={compress}, 形式={self.config['compression_format']}")
     
+    def set_max_workers(self, max_workers: int) -> None:
+        """最大ワーカー数を設定する
+        
+        Args:
+            max_workers: 最大ワーカー数
+        """
+        if max_workers > 0:
+            self.config["max_workers"] = max_workers
+            self.max_workers = max_workers
+            self._save_config()
+            logger.info(f"最大ワーカー数を設定しました: {max_workers}")
+        else:
+            logger.error("最大ワーカー数は1以上である必要があります")
+    
     def set_schedule(self, schedule_type: str, time_str: str = None, 
                     day_of_week: int = None, full_backup_day: int = None) -> None:
         """スケジュール設定を行う
@@ -220,7 +295,7 @@ class BackupManager:
         return False
     
     def _get_file_hash(self, filepath: str) -> str:
-        """ファイルのハッシュ値を計算する
+        """ファイルのハッシュ値を計算する（メモリ効率的）
         
         Args:
             filepath: ファイルパス
@@ -229,10 +304,108 @@ class BackupManager:
             ファイルのMD5ハッシュ値
         """
         hash_md5 = hashlib.md5()
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+        try:
+            with open(filepath, "rb") as f:
+                while chunk := f.read(CHUNK_SIZE):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            logger.error(f"ハッシュ計算エラー: {filepath} - {str(e)}")
+            raise
+    
+    def _should_exclude(self, filepath: str) -> bool:
+        """ファイルを除外すべきかどうかを判断する
+        
+        Args:
+            filepath: ファイルパス
+            
+        Returns:
+            除外すべき場合はTrue
+        """
+        filename = os.path.basename(filepath)
+        for pattern in self.config.get("exclude_patterns", []):
+            if pattern.startswith("*") and filename.endswith(pattern[1:]):
+                return True
+            elif pattern.endswith("*") and filename.startswith(pattern[:-1]):
+                return True
+            elif pattern == filename:
+                return True
+        return False
+    
+    def _collect_files(self, sources: List[str]) -> List[Tuple[str, str]]:
+        """バックアップ対象のファイルを収集する
+        
+        Args:
+            sources: バックアップ元のパスリスト
+            
+        Returns:
+            (絶対パス, 相対パス)のタプルのリスト
+        """
+        files = []
+        
+        for source_path in sources:
+            if not os.path.exists(source_path):
+                logger.warning(f"バックアップ元が存在しません: {source_path}")
+                continue
+                
+            if os.path.isfile(source_path):
+                if not self._should_exclude(source_path):
+                    files.append((source_path, os.path.basename(source_path)))
+            else:
+                for root, _, filenames in os.walk(source_path):
+                    for filename in filenames:
+                        file_path = os.path.join(root, filename)
+                        if not self._should_exclude(file_path):
+                            rel_path = os.path.relpath(file_path, os.path.dirname(source_path))
+                            files.append((file_path, rel_path))
+                            
+        return files
+    
+    def _process_file(self, file_info: Tuple[str, str], temp_dir: str, 
+                     last_manifest: Dict[str, str], is_full_backup: bool,
+                     file_processor: FileProcessor) -> Optional[Tuple[str, str]]:
+        """単一ファイルを処理する
+        
+        Args:
+            file_info: (絶対パス, 相対パス)のタプル
+            temp_dir: 一時ディレクトリ
+            last_manifest: 前回のマニフェスト
+            is_full_backup: 完全バックアップかどうか
+            file_processor: FileProcessorインスタンス
+            
+        Returns:
+            成功時は(相対パス, ハッシュ値)のタプル、スキップ/エラー時はNone
+        """
+        file_path, rel_path = file_info
+        
+        try:
+            # ファイルのハッシュ値を計算
+            file_hash = self._get_file_hash(file_path)
+            
+            # 差分バックアップの場合はチェック
+            if not is_full_backup and rel_path in last_manifest and last_manifest[rel_path] == file_hash:
+                logger.debug(f"変更なしのためスキップします: {file_path}")
+                file_processor.update_stats(skipped=1)
+                return None
+                
+            # 出力先のディレクトリを作成
+            dest_dir = os.path.join(temp_dir, os.path.dirname(rel_path))
+            os.makedirs(dest_dir, exist_ok=True)
+            
+            # ファイルをコピー
+            dest_file = os.path.join(temp_dir, rel_path)
+            shutil.copy2(file_path, dest_file)
+            
+            # ファイルサイズを取得
+            file_size = os.path.getsize(file_path)
+            file_processor.update_stats(processed=1, size=file_size)
+            
+            return (rel_path, file_hash)
+            
+        except Exception as e:
+            logger.error(f"ファイル処理エラー: {file_path} - {str(e)}")
+            file_processor.update_stats(error=1)
+            return None
     
     def _get_last_backup_manifest(self) -> Dict[str, str]:
         """最後のバックアップのマニフェストを取得する
@@ -295,7 +468,7 @@ class BackupManager:
                 tar.add(source_dir, arcname=os.path.basename(source_dir))
     
     def run_backup(self) -> bool:
-        """バックアップを実行する
+        """バックアップを実行する（並列処理版）
         
         Returns:
             バックアップが成功した場合はTrue
@@ -312,6 +485,7 @@ class BackupManager:
         is_full_backup = self.should_run_full_backup()
         backup_type = "完全" if is_full_backup else "差分"
         logger.info(f"{backup_type}バックアップを開始します")
+        logger.info(f"並列処理ワーカー数: {self.max_workers}")
         
         # 一時ディレクトリを作成
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -319,59 +493,81 @@ class BackupManager:
         os.makedirs(temp_dir, exist_ok=True)
         
         try:
-            # マニフェスト（ファイルとハッシュ値のマッピング）
-            manifest = {}
+            # ファイルを収集
+            logger.info("バックアップ対象ファイルを収集中...")
+            files = self._collect_files(self.config["sources"])
+            logger.info(f"対象ファイル数: {len(files)}")
+            
+            if not files:
+                logger.warning("バックアップ対象のファイルがありません")
+                return False
             
             # 前回のバックアップマニフェスト
             last_manifest = self._get_last_backup_manifest() if not is_full_backup else {}
             
-            # バックアップ元をコピー
-            for source_path in self.config["sources"]:
-                if not os.path.exists(source_path):
-                    logger.warning(f"バックアップ元が存在しません: {source_path}")
-                    continue
-                    
-                # ソースパスがファイルかディレクトリか判断
-                if os.path.isfile(source_path):
-                    # ファイルの場合
-                    file_hash = self._get_file_hash(source_path)
-                    rel_path = os.path.basename(source_path)
-                    
-                    # 差分バックアップの場合はチェック
-                    if not is_full_backup and rel_path in last_manifest and last_manifest[rel_path] == file_hash:
-                        # 変更なしの場合はスキップ
-                        logger.debug(f"変更なしのためスキップします: {source_path}")
-                        continue
-                        
-                    # ファイルをコピー
-                    dest_file = os.path.join(temp_dir, rel_path)
-                    shutil.copy2(source_path, dest_file)
-                    manifest[rel_path] = file_hash
-                    
-                else:
-                    # ディレクトリの場合
-                    for root, _, files in os.walk(source_path):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            # ソースからの相対パス
-                            rel_path = os.path.relpath(file_path, os.path.dirname(source_path))
-                            
-                            file_hash = self._get_file_hash(file_path)
-                            
-                            # 差分バックアップの場合はチェック
-                            if not is_full_backup and rel_path in last_manifest and last_manifest[rel_path] == file_hash:
-                                # 変更なしの場合はスキップ
-                                logger.debug(f"変更なしのためスキップします: {file_path}")
-                                continue
+            # FileProcessorインスタンスを作成
+            file_processor = FileProcessor(temp_dir, self.config["sources"])
+            
+            # マニフェスト（ファイルとハッシュ値のマッピング）
+            manifest = {}
+            manifest_lock = Lock()
+            
+            # 並列処理でファイルを処理
+            logger.info("ファイル処理を開始します...")
+            start_time = time.time()
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # プログレスバーの設定
+                if TQDM_AVAILABLE:
+                    pbar = tqdm(total=len(files), desc="処理中", unit="files")
+                
+                # ファイル処理タスクを投入
+                futures = {
+                    executor.submit(
+                        self._process_file, 
+                        file_info, 
+                        temp_dir, 
+                        last_manifest, 
+                        is_full_backup,
+                        file_processor
+                    ): file_info for file_info in files
+                }
+                
+                # 完了したタスクから結果を収集
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result:
+                            rel_path, file_hash = result
+                            with manifest_lock:
+                                manifest[rel_path] = file_hash
                                 
-                            # 出力先のディレクトリを作成
-                            dest_dir = os.path.join(temp_dir, os.path.dirname(rel_path))
-                            os.makedirs(dest_dir, exist_ok=True)
+                        if TQDM_AVAILABLE:
+                            pbar.update(1)
+                            stats = file_processor.get_stats()
+                            pbar.set_postfix({
+                                "処理": stats["processed"],
+                                "スキップ": stats["skipped"],
+                                "エラー": stats["errors"],
+                                "サイズ": f"{stats['total_size'] / (1024*1024):.1f}MB"
+                            })
                             
-                            # ファイルをコピー
-                            dest_file = os.path.join(temp_dir, rel_path)
-                            shutil.copy2(file_path, dest_file)
-                            manifest[rel_path] = file_hash
+                    except Exception as e:
+                        logger.error(f"ファイル処理中にエラーが発生しました: {str(e)}")
+                
+                if TQDM_AVAILABLE:
+                    pbar.close()
+            
+            # 処理時間と統計を表示
+            elapsed_time = time.time() - start_time
+            stats = file_processor.get_stats()
+            logger.info(f"ファイル処理完了 - 処理時間: {elapsed_time:.2f}秒")
+            logger.info(f"処理済み: {stats['processed']}件, スキップ: {stats['skipped']}件, エラー: {stats['errors']}件")
+            logger.info(f"総サイズ: {stats['total_size'] / (1024*1024):.2f}MB")
+            
+            if not manifest:
+                logger.warning("バックアップするファイルがありません（すべてスキップまたはエラー）")
+                return False
             
             # マニフェストファイルを作成
             manifest_path = os.path.join(temp_dir, "manifest.json")
@@ -384,6 +580,7 @@ class BackupManager:
             
             # 圧縮するかどうかで処理を分岐
             if self.config["compress"]:
+                logger.info("バックアップを圧縮中...")
                 self._compress_directory(temp_dir, backup_path)
                 logger.info(f"バックアップを圧縮しました: {backup_path}")
             else:
@@ -397,7 +594,12 @@ class BackupManager:
                 "type": "full" if is_full_backup else "differential",
                 "path": backup_path,
                 "manifest_path": manifest_path if not self.config["compress"] else None,
-                "size": os.path.getsize(backup_path) if os.path.exists(backup_path) else 0
+                "size": os.path.getsize(backup_path) if os.path.exists(backup_path) else 0,
+                "file_count": len(manifest),
+                "processed": stats["processed"],
+                "skipped": stats["skipped"],
+                "errors": stats["errors"],
+                "elapsed_time": elapsed_time
             }
             
             self.config["history"].append(backup_record)
@@ -429,7 +631,7 @@ def create_parser() -> argparse.ArgumentParser:
     Returns:
         ArgumentParser オブジェクト
     """
-    parser = argparse.ArgumentParser(description='クロスプラットフォームバックアッププログラム')
+    parser = argparse.ArgumentParser(description='クロスプラットフォームバックアッププログラム（並列処理対応版）')
     
     subparsers = parser.add_subparsers(dest='command', help='コマンド')
     
@@ -464,6 +666,10 @@ def create_parser() -> argparse.ArgumentParser:
     set_schedule_parser.add_argument('--time', help='実行時刻 (例: 00:00)')
     set_schedule_parser.add_argument('--day', type=int, choices=range(7), help='実行曜日 (0-6, 0=月曜日)')
     set_schedule_parser.add_argument('--full-day', type=int, choices=range(7), help='完全バックアップを行う曜日 (0-6, 0=月曜日)')
+    
+    # 並列処理設定コマンド
+    set_workers_parser = subparsers.add_parser('set-workers', help='並列処理のワーカー数を設定する')
+    set_workers_parser.add_argument('workers', type=int, help='ワーカー数')
     
     # 履歴表示コマンド
     list_parser = subparsers.add_parser('list', help='バックアップ履歴を表示する')
@@ -523,6 +729,10 @@ def main():
         # スケジュール設定
         backup_mgr.set_schedule(args.type, args.time, args.day, args.full_day)
         
+    elif args.command == 'set-workers':
+        # 並列処理ワーカー数設定
+        backup_mgr.set_max_workers(args.workers)
+        
     elif args.command == 'list':
         # バックアップ履歴を表示
         backups = backup_mgr.list_backups()
@@ -535,7 +745,17 @@ def main():
                 backup_type = "完全" if backup["type"] == "full" else "差分"
                 path = backup["path"]
                 size_mb = backup["size"] / (1024 * 1024)
-                print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path} ({size_mb:.2f} MB)")
+                
+                # 新しい統計情報を表示（存在する場合）
+                if "file_count" in backup:
+                    elapsed = backup.get("elapsed_time", 0)
+                    print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path}")
+                    print(f"   サイズ: {size_mb:.2f} MB, ファイル数: {backup['file_count']}")
+                    print(f"   処理: {backup.get('processed', 0)}件, スキップ: {backup.get('skipped', 0)}件, エラー: {backup.get('errors', 0)}件")
+                    print(f"   処理時間: {elapsed:.2f}秒")
+                else:
+                    # 旧形式の履歴
+                    print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path} ({size_mb:.2f} MB)")
                 
     elif args.command == 'show-config':
         # 現在の設定を表示
@@ -547,6 +767,11 @@ def main():
         print(f"圧縮: {'有効' if config['compress'] else '無効'}")
         if config['compress']:
             print(f"圧縮形式: {config['compression_format']}")
+        
+        print(f"並列処理ワーカー数: {config.get('max_workers', DEFAULT_MAX_WORKERS)}")
+        
+        if config.get('exclude_patterns'):
+            print(f"除外パターン: {', '.join(config['exclude_patterns'])}")
         
         schedule = config['schedule']
         schedule_types = {"daily": "毎日", "weekly": "毎週", "monthly": "毎月"}
