@@ -615,10 +615,53 @@ class BackupManager:
             # 一時ディレクトリを削除
             if os.path.exists(temp_dir) and self.config["compress"]:
                 shutil.rmtree(temp_dir)
-                
+
+    def restore_backup(self, backup_path: str, restore_path: str) -> bool:
+        """バックアップを復元する
+
+        Args:
+            backup_path: 復元するバックアップファイルまたはディレクトリのパス
+            restore_path: 復元先ディレクトリのパス
+
+        Returns:
+            復元が成功した場合は True
+        """
+        if not os.path.exists(backup_path):
+            logger.error(f"バックアップファイルが見つかりません: {backup_path}")
+            return False
+
+        try:
+            os.makedirs(restore_path, exist_ok=True)
+
+            if os.path.isdir(backup_path):
+                # 圧縮なしバックアップの場合はディレクトリをコピー
+                for root, dirs, files in os.walk(backup_path):
+                    rel_root = os.path.relpath(root, backup_path)
+                    dest_root = os.path.join(restore_path, rel_root)
+                    os.makedirs(dest_root, exist_ok=True)
+                    for file in files:
+                        src_file = os.path.join(root, file)
+                        dest_file = os.path.join(dest_root, file)
+                        shutil.copy2(src_file, dest_file)
+            elif backup_path.endswith('.zip'):
+                with zipfile.ZipFile(backup_path, 'r') as zipf:
+                    zipf.extractall(restore_path)
+            elif backup_path.endswith('.tar.gz'):
+                with tarfile.open(backup_path, 'r:gz') as tar:
+                    tar.extractall(restore_path)
+            else:
+                logger.error(f"サポートされていないバックアップ形式です: {backup_path}")
+                return False
+
+            logger.info(f"バックアップを復元しました: {restore_path}")
+            return True
+        except Exception as e:
+            logger.error(f"バックアップの復元に失敗しました: {str(e)}")
+            return False
+
     def list_backups(self) -> List[Dict[str, Any]]:
         """バックアップの履歴を取得する
-        
+
         Returns:
             バックアップ履歴のリスト
         """
@@ -637,6 +680,11 @@ def create_parser() -> argparse.ArgumentParser:
     
     # バックアップ実行コマンド
     run_parser = subparsers.add_parser('run', help='バックアップを実行する')
+
+    # バックアップ復元コマンド
+    restore_parser = subparsers.add_parser('restore', help='バックアップを復元する')
+    restore_parser.add_argument('source', help='復元するバックアップのパス')
+    restore_parser.add_argument('destination', help='復元先のパス')
     
     # バックアップ元追加コマンド
     add_source_parser = subparsers.add_parser('add-source', help='バックアップ元を追加する')
@@ -695,7 +743,15 @@ def main():
             print("バックアップが正常に完了しました")
         else:
             print("バックアップに失敗しました。ログを確認してください")
-            
+
+    elif args.command == 'restore':
+        # バックアップを復元
+        success = backup_mgr.restore_backup(args.source, args.destination)
+        if success:
+            print("バックアップを復元しました")
+        else:
+            print("バックアップの復元に失敗しました。ログを確認してください")
+
     elif args.command == 'add-source':
         # バックアップ元を追加
         backup_mgr.add_source(args.path)

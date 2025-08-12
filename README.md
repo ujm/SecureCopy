@@ -15,6 +15,7 @@ A flexible and powerful backup solution for Windows and Linux systems. Supports 
 - Flexible scheduling (daily, weekly, monthly)
 - Command-line interface for easy automation
 - Network and external drive support
+- Backup restoration
 
 ### Prerequisites
 - Python 3.6 or later
@@ -72,6 +73,11 @@ A flexible and powerful backup solution for Windows and Linux systems. Supports 
    python SyncVault.py show-config
    ```
 
+7. Restore a backup:
+   ```bash
+   python SyncVault.py restore /path/to/backup /path/to/restore/destination
+   ```
+
 ### Scheduling
 
 #### Windows
@@ -115,6 +121,7 @@ MIT License
 - 柔軟なスケジュール設定（日次、週次、月次）
 - 自動化しやすいコマンドラインインターフェース
 - ネットワークドライブと外部ドライブのサポート
+- バックアップデータの復元機能
 
 ### 前提条件
 - Python 3.6以上
@@ -172,6 +179,11 @@ MIT License
    python SyncVault.py show-config
    ```
 
+7. バックアップを復元：
+   ```bash
+   python SyncVault.py restore /path/to/backup /path/to/restore/destination
+   ```
+
 ### スケジュール設定
 
 #### Windows
@@ -200,4 +212,4 @@ crontab -e
 - 設定が破損している場合は、`~/.backup_config.json`を削除して再設定
 
 ### ライセンス
-MITライセンス# SecureCopy
+MITライセンス
