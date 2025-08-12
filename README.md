@@ -25,51 +25,51 @@ A flexible and powerful backup solution for Windows and Linux systems. Supports 
 1. Clone this repository:
    ```bash
    git clone https://github.com/ujm/SecureCopy.git
-   cd backup-tool
+   cd SecureCopy
    ```
 
 2. Make the script executable (Linux):
    ```bash
-   chmod +x backup.py
+   chmod +x SyncVault.py
    ```
 
 ### Basic Usage
 
 1. Add backup sources:
    ```bash
-   python backup.py add-source /path/to/source
+   python SyncVault.py add-source /path/to/source
    ```
 
 2. Set backup destination:
    ```bash
-   python backup.py set-destination /path/to/backup/destination
+   python SyncVault.py set-destination /path/to/backup/destination
    ```
 
 3. Configure backup settings:
    ```bash
    # Set backup type (full or differential)
-   python backup.py set-type differential
+   python SyncVault.py set-type differential
 
    # Enable compression
-   python backup.py set-compress --enable --format zip
+   python SyncVault.py set-compress --enable --format zip
 
    # Set schedule (daily, weekly, monthly)
-   python backup.py set-schedule weekly --time 00:00 --day 0 --full-day 0
+   python SyncVault.py set-schedule weekly --time 00:00 --day 0 --full-day 0
    ```
 
 4. Run backup:
    ```bash
-   python backup.py run
+   python SyncVault.py run
    ```
 
 5. List backup history:
    ```bash
-   python backup.py list
+   python SyncVault.py list
    ```
 
 6. View current configuration:
    ```bash
-   python backup.py show-config
+   python SyncVault.py show-config
    ```
 
 ### Scheduling
@@ -81,7 +81,7 @@ A flexible and powerful backup solution for Windows and Linux systems. Supports 
 3. Set trigger (daily, weekly, etc.)
 4. Action: Start a program
 5. Program: `python` or `pythonw`
-6. Arguments: `C:\path\to\backup.py run`
+6. Arguments: `C:\path\to\SyncVault.py run`
 
 #### Linux
 
@@ -89,7 +89,7 @@ Add to crontab:
 ```bash
 crontab -e
 # Add line (example: run daily at midnight):
-0 0 * * * /usr/bin/python3 /path/to/backup.py run
+0 0 * * * /usr/bin/python3 /path/to/SyncVault.py run
 ```
 
 ### Troubleshooting
@@ -125,51 +125,51 @@ MIT License
 1. このリポジトリをクローン：
    ```bash
    git clone https://github.com/ujm/SecureCopy.git
-   cd backup-tool
+   cd SecureCopy
    ```
 
 2. スクリプトに実行権限を付与（Linuxの場合）：
    ```bash
-   chmod +x backup.py
+   chmod +x SyncVault.py
    ```
 
 ### 基本的な使い方
 
 1. バックアップ元を追加：
    ```bash
-   python backup.py add-source /path/to/source
+   python SyncVault.py add-source /path/to/source
    ```
 
 2. バックアップ先を設定：
    ```bash
-   python backup.py set-destination /path/to/backup/destination
+   python SyncVault.py set-destination /path/to/backup/destination
    ```
 
 3. バックアップ設定を構成：
    ```bash
    # バックアップタイプを設定（完全または差分）
-   python backup.py set-type differential
+   python SyncVault.py set-type differential
 
    # 圧縮を有効化
-   python backup.py set-compress --enable --format zip
+   python SyncVault.py set-compress --enable --format zip
 
    # スケジュール設定（毎日、毎週、毎月）
-   python backup.py set-schedule weekly --time 00:00 --day 0 --full-day 0
+   python SyncVault.py set-schedule weekly --time 00:00 --day 0 --full-day 0
    ```
 
 4. バックアップを実行：
    ```bash
-   python backup.py run
+   python SyncVault.py run
    ```
 
 5. バックアップ履歴を表示：
    ```bash
-   python backup.py list
+   python SyncVault.py list
    ```
 
 6. 現在の設定を表示：
    ```bash
-   python backup.py show-config
+   python SyncVault.py show-config
    ```
 
 ### スケジュール設定
@@ -181,7 +181,7 @@ MIT License
 3. トリガーを設定（毎日、毎週など）
 4. 操作：プログラムの開始
 5. プログラム：`python`または`pythonw`
-6. 引数：`C:\path\to\backup.py run`
+6. 引数：`C:\path\to\SyncVault.py run`
 
 #### Linux
 
@@ -189,7 +189,7 @@ cronに追加：
 ```bash
 crontab -e
 # 以下の行を追加（例：毎日深夜0時に実行）：
-0 0 * * * /usr/bin/python3 /path/to/backup.py run
+0 0 * * * /usr/bin/python3 /path/to/SyncVault.py run
 ```
 
 ### トラブルシューティング
