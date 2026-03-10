@@ -19,6 +19,7 @@ import fnmatch
 import hashlib
 import platform
 import time
+import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,9 +48,202 @@ logger = logging.getLogger("backup")
 # 設定ファイルのデフォルトパス
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.backup_config.json")
 
+# カタログDBのデフォルトパス
+DEFAULT_CATALOG_PATH = os.path.expanduser("~/.backup_catalog.db")
+
 # 並列処理の設定
 DEFAULT_MAX_WORKERS = min(32, (os.cpu_count() or 1) * 2)
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+
+class BackupCatalog:
+    """SQLiteを使用してバックアップカタログを管理するクラス"""
+
+    def __init__(self, db_path: str = DEFAULT_CATALOG_PATH):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _init_db(self) -> None:
+        """データベースとテーブルを初期化する"""
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS backups (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT NOT NULL,
+                    backup_type     TEXT NOT NULL,
+                    backup_path     TEXT NOT NULL,
+                    manifest_path   TEXT,
+                    total_size      INTEGER DEFAULT 0,
+                    file_count      INTEGER DEFAULT 0,
+                    processed       INTEGER DEFAULT 0,
+                    skipped         INTEGER DEFAULT 0,
+                    errors          INTEGER DEFAULT 0,
+                    elapsed_time    REAL DEFAULT 0.0
+                );
+
+                CREATE TABLE IF NOT EXISTS catalog_files (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    backup_id   INTEGER NOT NULL REFERENCES backups(id) ON DELETE CASCADE,
+                    rel_path    TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    file_hash   TEXT NOT NULL,
+                    file_size   INTEGER DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_catalog_files_backup_id
+                    ON catalog_files(backup_id);
+                CREATE INDEX IF NOT EXISTS idx_catalog_files_rel_path
+                    ON catalog_files(rel_path);
+            """)
+
+    def register_backup(
+        self,
+        backup_record: Dict[str, Any],
+        manifest: Dict[str, str],
+        file_sizes: Dict[str, int],
+        source_paths: Dict[str, str],
+    ) -> int:
+        """バックアップセッションとファイル一覧をカタログに登録する
+
+        Args:
+            backup_record: run_backup で構築したバックアップ情報辞書
+            manifest: {rel_path: file_hash} のマッピング
+            file_sizes: {rel_path: file_size_bytes} のマッピング
+            source_paths: {rel_path: absolute_source_path} のマッピング
+
+        Returns:
+            登録されたバックアップの id
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO backups
+                    (timestamp, backup_type, backup_path, manifest_path,
+                     total_size, file_count, processed, skipped, errors, elapsed_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    backup_record["timestamp"],
+                    backup_record["type"],
+                    backup_record["path"],
+                    backup_record.get("manifest_path"),
+                    backup_record.get("size", 0),
+                    backup_record.get("file_count", 0),
+                    backup_record.get("processed", 0),
+                    backup_record.get("skipped", 0),
+                    backup_record.get("errors", 0),
+                    backup_record.get("elapsed_time", 0.0),
+                ),
+            )
+            backup_id = cur.lastrowid
+
+            rows = [
+                (
+                    backup_id,
+                    rel_path,
+                    source_paths.get(rel_path, ""),
+                    file_hash,
+                    file_sizes.get(rel_path, 0),
+                )
+                for rel_path, file_hash in manifest.items()
+            ]
+            conn.executemany(
+                """
+                INSERT INTO catalog_files
+                    (backup_id, rel_path, source_path, file_hash, file_size)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return backup_id
+
+    def list_backups(self) -> List[Dict[str, Any]]:
+        """登録されているバックアップ一覧を返す"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM backups ORDER BY timestamp DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_backup_files(self, backup_id: int) -> List[Dict[str, Any]]:
+        """指定バックアップに含まれるファイル一覧を返す
+
+        Args:
+            backup_id: バックアップ ID
+
+        Returns:
+            ファイル情報の辞書リスト
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM catalog_files WHERE backup_id = ? ORDER BY rel_path",
+                (backup_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_file_backups(self, pattern: str) -> List[Dict[str, Any]]:
+        """ファイル名パターンに一致するファイルが含まれるバックアップを検索する
+
+        Args:
+            pattern: ファイルの相対パスに対する SQL LIKE パターン（例: '%.py'）
+
+        Returns:
+            マッチしたファイルとそのバックアップ情報の辞書リスト
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    b.id            AS backup_id,
+                    b.timestamp,
+                    b.backup_type,
+                    b.backup_path,
+                    f.rel_path,
+                    f.source_path,
+                    f.file_hash,
+                    f.file_size
+                FROM catalog_files f
+                JOIN backups b ON b.id = f.backup_id
+                WHERE f.rel_path LIKE ?
+                ORDER BY b.timestamp DESC, f.rel_path
+                """,
+                (pattern,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_file_history(self, rel_path: str) -> List[Dict[str, Any]]:
+        """特定ファイルのバックアップ履歴を返す
+
+        Args:
+            rel_path: カタログ内の相対パス（完全一致）
+
+        Returns:
+            バックアップ履歴の辞書リスト（新しい順）
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    b.id            AS backup_id,
+                    b.timestamp,
+                    b.backup_type,
+                    b.backup_path,
+                    f.file_hash,
+                    f.file_size
+                FROM catalog_files f
+                JOIN backups b ON b.id = f.backup_id
+                WHERE f.rel_path = ?
+                ORDER BY b.timestamp DESC
+                """,
+                (rel_path,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 class FileProcessor:
     """ファイル処理用のヘルパークラス"""
@@ -85,15 +279,18 @@ class FileProcessor:
 class BackupManager:
     """バックアップ処理を管理するクラス"""
     
-    def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
+    def __init__(self, config_path: str = DEFAULT_CONFIG_PATH,
+                 catalog_path: str = DEFAULT_CATALOG_PATH):
         """初期化処理
-        
+
         Args:
             config_path: 設定ファイルのパス
+            catalog_path: SQLite カタログ DB のパス
         """
         self.config_path = config_path
         self.config = self._load_config()
         self.max_workers = self.config.get("max_workers", DEFAULT_MAX_WORKERS)
+        self.catalog = BackupCatalog(catalog_path)
         
     def _load_config(self) -> Dict[str, Any]:
         """設定ファイルを読み込む
@@ -358,47 +555,48 @@ class BackupManager:
                             
         return files
     
-    def _process_file(self, file_info: Tuple[str, str], temp_dir: str, 
+    def _process_file(self, file_info: Tuple[str, str], temp_dir: str,
                      last_manifest: Dict[str, str], is_full_backup: bool,
-                     file_processor: FileProcessor) -> Optional[Tuple[str, str]]:
+                     file_processor: FileProcessor) -> Optional[Tuple[str, str, str, int]]:
         """単一ファイルを処理する
-        
+
         Args:
             file_info: (絶対パス, 相対パス)のタプル
             temp_dir: 一時ディレクトリ
             last_manifest: 前回のマニフェスト
             is_full_backup: 完全バックアップかどうか
             file_processor: FileProcessorインスタンス
-            
+
         Returns:
-            成功時は(相対パス, ハッシュ値)のタプル、スキップ/エラー時はNone
+            成功時は(相対パス, ハッシュ値, 絶対パス, ファイルサイズ)のタプル、
+            スキップ/エラー時はNone
         """
         file_path, rel_path = file_info
-        
+
         try:
             # ファイルのハッシュ値を計算
             file_hash = self._get_file_hash(file_path)
-            
+
             # 差分バックアップの場合はチェック
             if not is_full_backup and rel_path in last_manifest and last_manifest[rel_path] == file_hash:
                 logger.debug(f"変更なしのためスキップします: {file_path}")
                 file_processor.update_stats(skipped=1)
                 return None
-                
+
             # 出力先のディレクトリを作成
             dest_dir = os.path.join(temp_dir, os.path.dirname(rel_path))
             os.makedirs(dest_dir, exist_ok=True)
-            
+
             # ファイルをコピー
             dest_file = os.path.join(temp_dir, rel_path)
             shutil.copy2(file_path, dest_file)
-            
+
             # ファイルサイズを取得
             file_size = os.path.getsize(file_path)
             file_processor.update_stats(processed=1, size=file_size)
-            
-            return (rel_path, file_hash)
-            
+
+            return (rel_path, file_hash, file_path, file_size)
+
         except Exception as e:
             logger.error(f"ファイル処理エラー: {file_path} - {str(e)}")
             file_processor.update_stats(error=1)
@@ -507,6 +705,8 @@ class BackupManager:
             
             # マニフェスト（ファイルとハッシュ値のマッピング）
             manifest = {}
+            file_sizes: Dict[str, int] = {}
+            source_paths: Dict[str, str] = {}
             manifest_lock = Lock()
             
             # 並列処理でファイルを処理
@@ -535,9 +735,11 @@ class BackupManager:
                     try:
                         result = future.result()
                         if result:
-                            rel_path, file_hash = result
+                            rel_path, file_hash, src_path, fsize = result
                             with manifest_lock:
                                 manifest[rel_path] = file_hash
+                                file_sizes[rel_path] = fsize
+                                source_paths[rel_path] = src_path
                                 
                         if TQDM_AVAILABLE:
                             pbar.update(1)
@@ -606,7 +808,16 @@ class BackupManager:
             
             self.config["history"].append(backup_record)
             self._save_config()
-            
+
+            # SQLite カタログにバックアップとファイル一覧を登録
+            try:
+                self.catalog.register_backup(
+                    backup_record, manifest, file_sizes, source_paths
+                )
+                logger.info("バックアップカタログを更新しました")
+            except Exception as e:
+                logger.warning(f"カタログ更新に失敗しました（バックアップ自体は成功）: {e}")
+
             return True
             
         except Exception as e:
@@ -659,6 +870,77 @@ class BackupManager:
             return True
         except Exception as e:
             logger.error(f"バックアップの復元に失敗しました: {str(e)}")
+            return False
+
+    def restore_file(self, rel_path: str, backup_id: int, restore_path: str) -> bool:
+        """カタログを使って特定のファイルだけを復元する
+
+        Args:
+            rel_path: カタログ内の相対パス（catalog-history で確認できる値）
+            backup_id: バックアップ ID（catalog-search / catalog-history で確認できる値）
+            restore_path: ファイルの復元先ディレクトリ
+
+        Returns:
+            成功した場合は True
+        """
+        # カタログからバックアップ情報を取得
+        backups = self.catalog.list_backups()
+        target_backup = next((b for b in backups if b["id"] == backup_id), None)
+        if not target_backup:
+            logger.error(f"バックアップ ID {backup_id} が見つかりません")
+            return False
+
+        backup_path = target_backup["backup_path"]
+        if not os.path.exists(backup_path):
+            logger.error(f"バックアップファイルが見つかりません: {backup_path}")
+            return False
+
+        os.makedirs(restore_path, exist_ok=True)
+        dest_file = os.path.join(restore_path, os.path.basename(rel_path))
+
+        try:
+            if os.path.isdir(backup_path):
+                src = os.path.join(backup_path, rel_path)
+                if not os.path.exists(src):
+                    logger.error(f"バックアップ内にファイルが見つかりません: {rel_path}")
+                    return False
+                shutil.copy2(src, dest_file)
+
+            elif backup_path.endswith(".zip"):
+                with zipfile.ZipFile(backup_path, "r") as zipf:
+                    # ZIP 内のパス区切りを正規化
+                    zip_path = rel_path.replace(os.sep, "/")
+                    if zip_path not in zipf.namelist():
+                        logger.error(f"ZIP 内にファイルが見つかりません: {zip_path}")
+                        return False
+                    with zipf.open(zip_path) as src_f, open(dest_file, "wb") as dst_f:
+                        shutil.copyfileobj(src_f, dst_f)
+
+            elif backup_path.endswith(".tar.gz"):
+                with tarfile.open(backup_path, "r:gz") as tar:
+                    # tar 内のパスはアーカイブ名のプレフィックスが付く場合がある
+                    members = tar.getnames()
+                    # rel_path に一致するメンバーを探す
+                    match = next(
+                        (m for m in members if m == rel_path or m.endswith("/" + rel_path)),
+                        None,
+                    )
+                    if match is None:
+                        logger.error(f"tar.gz 内にファイルが見つかりません: {rel_path}")
+                        return False
+                    member = tar.getmember(match)
+                    with tar.extractfile(member) as src_f, open(dest_file, "wb") as dst_f:
+                        shutil.copyfileobj(src_f, dst_f)
+
+            else:
+                logger.error(f"サポートされていないバックアップ形式です: {backup_path}")
+                return False
+
+            logger.info(f"ファイルを復元しました: {rel_path} -> {dest_file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"ファイル復元に失敗しました: {e}")
             return False
 
     def list_backups(self) -> List[Dict[str, Any]]:
@@ -723,10 +1005,36 @@ def create_parser() -> argparse.ArgumentParser:
     
     # 履歴表示コマンド
     list_parser = subparsers.add_parser('list', help='バックアップ履歴を表示する')
-    
+
     # 設定表示コマンド
     show_config_parser = subparsers.add_parser('show-config', help='現在の設定を表示する')
-    
+
+    # カタログ検索コマンド
+    catalog_search_parser = subparsers.add_parser(
+        'catalog-search',
+        help='カタログからファイルを検索する（例: "%.py" や "%report%"）',
+    )
+    catalog_search_parser.add_argument(
+        'pattern',
+        help='SQL LIKE パターン（% がワイルドカード）。例: %%.py  docs/%%.txt',
+    )
+
+    # ファイル履歴表示コマンド
+    catalog_history_parser = subparsers.add_parser(
+        'catalog-history',
+        help='特定ファイルのバックアップ履歴を表示する',
+    )
+    catalog_history_parser.add_argument('rel_path', help='カタログ内の相対パス（完全一致）')
+
+    # ファイル単位の部分復元コマンド
+    restore_file_parser = subparsers.add_parser(
+        'restore-file',
+        help='カタログを使って特定ファイルのみを復元する',
+    )
+    restore_file_parser.add_argument('rel_path', help='復元するファイルの相対パス')
+    restore_file_parser.add_argument('backup_id', type=int, help='バックアップ ID（catalog-search で確認）')
+    restore_file_parser.add_argument('destination', help='復元先ディレクトリ')
+
     return parser
 
 
@@ -845,6 +1153,44 @@ def main():
         weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
         print(f"完全バックアップ実行曜日: {weekdays[full_day]}")
     
+    elif args.command == 'catalog-search':
+        # カタログからファイルを検索
+        results = backup_mgr.catalog.find_file_backups(args.pattern)
+        if not results:
+            print("該当するファイルが見つかりませんでした")
+        else:
+            print(f"{len(results)} 件のファイルが見つかりました:")
+            for r in results:
+                size_kb = r["file_size"] / 1024
+                btype = "完全" if r["backup_type"] == "full" else "差分"
+                print(
+                    f"  [{r['backup_id']}] {r['timestamp']}  ({btype})  "
+                    f"{r['rel_path']}  ({size_kb:.1f} KB)  hash:{r['file_hash'][:8]}..."
+                )
+
+    elif args.command == 'catalog-history':
+        # 特定ファイルの履歴を表示
+        history = backup_mgr.catalog.get_file_history(args.rel_path)
+        if not history:
+            print(f"ファイルのバックアップ履歴が見つかりません: {args.rel_path}")
+        else:
+            print(f"'{args.rel_path}' のバックアップ履歴 ({len(history)} 件):")
+            for r in history:
+                size_kb = r["file_size"] / 1024
+                btype = "完全" if r["backup_type"] == "full" else "差分"
+                print(
+                    f"  ID={r['backup_id']}  [{r['timestamp']}]  {btype}  "
+                    f"{size_kb:.1f} KB  hash:{r['file_hash'][:8]}..."
+                )
+
+    elif args.command == 'restore-file':
+        # ファイル単位の部分復元
+        success = backup_mgr.restore_file(args.rel_path, args.backup_id, args.destination)
+        if success:
+            print(f"ファイルを復元しました: {args.destination}")
+        else:
+            print("ファイルの復元に失敗しました。ログを確認してください")
+
     else:
         # コマンドが指定されていない場合はヘルプを表示
         parser.print_help()
