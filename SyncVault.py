@@ -922,12 +922,14 @@ class BackupManager:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
-    def restore_backup(self, backup_path: str, restore_path: str) -> bool:
+    def restore_backup(self, backup_path: str, restore_path: str,
+                       dry_run: bool = False) -> bool:
         """バックアップを復元する
 
         Args:
             backup_path: 復元するバックアップファイルまたはディレクトリのパス
             restore_path: 復元先ディレクトリのパス
+            dry_run: True の場合は実際のコピーを行わず、復元対象ファイルを表示するのみ
 
         Returns:
             復元が成功した場合は True
@@ -937,6 +939,25 @@ class BackupManager:
             return False
 
         try:
+            if dry_run:
+                print(f"[ドライラン] 復元元: {backup_path}")
+                print(f"[ドライラン] 復元先: {restore_path}")
+                if os.path.isdir(backup_path):
+                    for root, _, files in os.walk(backup_path):
+                        for file in files:
+                            src = os.path.join(root, file)
+                            rel = os.path.relpath(src, backup_path)
+                            print(f"  {rel}")
+                elif backup_path.endswith('.zip'):
+                    with zipfile.ZipFile(backup_path, 'r') as zipf:
+                        for name in zipf.namelist():
+                            print(f"  {name}")
+                elif backup_path.endswith('.tar.gz'):
+                    with tarfile.open(backup_path, 'r:gz') as tar:
+                        for name in tar.getnames():
+                            print(f"  {name}")
+                return True
+
             os.makedirs(restore_path, exist_ok=True)
 
             if os.path.isdir(backup_path):
@@ -964,6 +985,17 @@ class BackupManager:
         except Exception as e:
             logger.error(f"バックアップの復元に失敗しました: {str(e)}")
             return False
+
+    def get_latest_backup_id(self) -> Optional[int]:
+        """カタログに登録された最新バックアップの ID を返す。
+
+        Returns:
+            最新バックアップの ID、またはバックアップが存在しない場合は None
+        """
+        backups = self.catalog.list_backups()
+        if not backups:
+            return None
+        return backups[0]["id"]
 
     def restore_file(self, rel_path: str, backup_id: int, restore_path: str) -> bool:
         """カタログを使って特定のファイルだけを復元する
@@ -1061,8 +1093,16 @@ def create_parser() -> argparse.ArgumentParser:
 
     # バックアップ復元コマンド
     restore_parser = subparsers.add_parser('restore', help='バックアップを復元する')
-    restore_parser.add_argument('source', help='復元するバックアップのパス')
     restore_parser.add_argument('destination', help='復元先のパス')
+    restore_source_group = restore_parser.add_mutually_exclusive_group()
+    restore_source_group.add_argument('--path', metavar='BACKUP_PATH',
+                                      help='復元するバックアップファイルまたはディレクトリのパス')
+    restore_source_group.add_argument('--id', type=int, metavar='CATALOG_ID',
+                                      help='カタログ ID でバックアップを指定 (list コマンドで確認)')
+    restore_source_group.add_argument('--latest', action='store_true',
+                                      help='最新のバックアップを復元する')
+    restore_parser.add_argument('--dry-run', action='store_true',
+                                help='実際のコピーは行わず、復元対象ファイルのみ表示する')
     
     # バックアップ元追加コマンド
     add_source_parser = subparsers.add_parser('add-source', help='バックアップ元を追加する')
@@ -1106,11 +1146,11 @@ def create_parser() -> argparse.ArgumentParser:
     # カタログ検索コマンド
     catalog_search_parser = subparsers.add_parser(
         'catalog-search',
-        help='カタログからファイルを検索する（例: "%.py" や "%report%"）',
+        help='カタログからファイルを検索する（例: "*.py" や "*report*"）',
     )
     catalog_search_parser.add_argument(
         'pattern',
-        help='SQL LIKE パターン（% がワイルドカード）。例: %%.py  docs/%%.txt',
+        help='検索パターン。glob 形式（*.py）または SQL LIKE 形式（%%.py）が使えます（* は %% に変換）。',
     )
 
     # ファイル履歴表示コマンド
@@ -1126,8 +1166,12 @@ def create_parser() -> argparse.ArgumentParser:
         help='カタログを使って特定ファイルのみを復元する',
     )
     restore_file_parser.add_argument('rel_path', help='復元するファイルの相対パス')
-    restore_file_parser.add_argument('backup_id', type=int, help='バックアップ ID（catalog-search で確認）')
     restore_file_parser.add_argument('destination', help='復元先ディレクトリ')
+    restore_file_id_group = restore_file_parser.add_mutually_exclusive_group()
+    restore_file_id_group.add_argument('--id', type=int, metavar='CATALOG_ID',
+                                       help='バックアップ ID（catalog-search / list で確認）')
+    restore_file_id_group.add_argument('--latest', action='store_true',
+                                       help='最新バックアップからファイルを復元する')
 
     return parser
 
@@ -1144,17 +1188,67 @@ def main():
         # バックアップを実行
         success = backup_mgr.run_backup()
         if success:
-            print("バックアップが正常に完了しました")
+            # 最新の履歴エントリからサマリーを表示
+            history = backup_mgr.list_backups()
+            if history:
+                last = history[-1]
+                btype = "完全" if last.get("type") == "full" else "差分"
+                size_mb = last.get("size", 0) / (1024 * 1024)
+                elapsed = last.get("elapsed_time", 0)
+                print("=" * 50)
+                print("バックアップ完了")
+                print(f"  種類       : {btype}バックアップ")
+                print(f"  保存先     : {last.get('path', '')}")
+                print(f"  ファイル数 : {last.get('file_count', 0)} 件")
+                print(f"  サイズ     : {size_mb:.2f} MB")
+                print(f"  処理時間   : {elapsed:.2f} 秒")
+                if last.get("errors", 0) > 0:
+                    print(f"  警告       : {last['errors']} 件のエラーがありました（backup.log を確認）")
+                print("=" * 50)
+            else:
+                print("バックアップが正常に完了しました")
         else:
-            print("バックアップに失敗しました。ログを確認してください")
+            print("バックアップに失敗しました。ログ（backup.log）を確認してください")
 
     elif args.command == 'restore':
         # バックアップを復元
-        success = backup_mgr.restore_backup(args.source, args.destination)
-        if success:
-            print("バックアップを復元しました")
+        # 復元元の決定
+        backup_path = None
+        if args.latest:
+            latest_id = backup_mgr.get_latest_backup_id()
+            if latest_id is None:
+                print("カタログにバックアップが登録されていません。先に run を実行してください")
+                return
+            backups = backup_mgr.catalog.list_backups()
+            target = next((b for b in backups if b["id"] == latest_id), None)
+            if target is None:
+                print("最新バックアップの情報が見つかりません")
+                return
+            backup_path = target["backup_path"]
+            print(f"最新バックアップを使用: [{latest_id}] {target['timestamp']}  {backup_path}")
+        elif args.id is not None:
+            backups = backup_mgr.catalog.list_backups()
+            target = next((b for b in backups if b["id"] == args.id), None)
+            if target is None:
+                print(f"カタログ ID {args.id} のバックアップが見つかりません（list コマンドで ID を確認してください）")
+                return
+            backup_path = target["backup_path"]
+            print(f"バックアップを使用: [{args.id}] {target['timestamp']}  {backup_path}")
+        elif args.path:
+            backup_path = args.path
         else:
-            print("バックアップの復元に失敗しました。ログを確認してください")
+            print("復元元を指定してください: --path BACKUP_PATH | --id CATALOG_ID | --latest")
+            return
+
+        dry_run = args.dry_run
+        if dry_run:
+            print("※ ドライランモード: ファイルのコピーは行いません")
+        success = backup_mgr.restore_backup(backup_path, args.destination, dry_run=dry_run)
+        if success:
+            if not dry_run:
+                print(f"バックアップを復元しました: {args.destination}")
+        else:
+            print("バックアップの復元に失敗しました。ログ（backup.log）を確認してください")
 
     elif args.command == 'add-source':
         # バックアップ元を追加
@@ -1194,28 +1288,42 @@ def main():
         backup_mgr.set_max_workers(args.workers)
         
     elif args.command == 'list':
-        # バックアップ履歴を表示
-        backups = backup_mgr.list_backups()
-        if not backups:
+        # バックアップ履歴を表示（catalog DB と config 履歴を統合して表示）
+        catalog_backups = backup_mgr.catalog.list_backups()
+        config_history = backup_mgr.list_backups()
+
+        if not catalog_backups and not config_history:
             print("バックアップ履歴はありません")
         else:
-            print(f"合計 {len(backups)} 件のバックアップ:")
-            for i, backup in enumerate(backups, 1):
-                timestamp = backup["timestamp"]
-                backup_type = "完全" if backup["type"] == "full" else "差分"
-                path = backup["path"]
-                size_mb = backup["size"] / (1024 * 1024)
-                
-                # 新しい統計情報を表示（存在する場合）
-                if "file_count" in backup:
-                    elapsed = backup.get("elapsed_time", 0)
-                    print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path}")
-                    print(f"   サイズ: {size_mb:.2f} MB, ファイル数: {backup['file_count']}")
-                    print(f"   処理: {backup.get('processed', 0)}件, スキップ: {backup.get('skipped', 0)}件, エラー: {backup.get('errors', 0)}件")
-                    print(f"   処理時間: {elapsed:.2f}秒")
-                else:
-                    # 旧形式の履歴
-                    print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path} ({size_mb:.2f} MB)")
+            # catalog_backups を優先。catalog に未登録の旧形式履歴も補完表示
+            if catalog_backups:
+                print(f"合計 {len(catalog_backups)} 件のバックアップ（catalog）:")
+                print(f"{'ID':>4}  {'日時':<17}  {'種類':^4}  {'ファイル数':>8}  {'サイズ':>8}  パス")
+                print("-" * 80)
+                for b in catalog_backups:
+                    btype = "完全" if b["backup_type"] == "full" else "差分"
+                    size_mb = b.get("total_size", 0) / (1024 * 1024)
+                    print(f"{b['id']:>4}  {b['timestamp']:<17}  {btype:^4}  "
+                          f"{b.get('file_count', 0):>8}  {size_mb:>7.2f}MB  {b['backup_path']}")
+                print()
+                print("復元例: python SyncVault.py restore --id <ID> <復元先>")
+                print("        python SyncVault.py restore --latest <復元先>")
+            else:
+                # catalog が空の場合は旧形式の config 履歴を表示
+                print(f"合計 {len(config_history)} 件のバックアップ（設定ファイル）:")
+                for i, backup in enumerate(config_history, 1):
+                    timestamp = backup["timestamp"]
+                    backup_type = "完全" if backup["type"] == "full" else "差分"
+                    path = backup["path"]
+                    size_mb = backup["size"] / (1024 * 1024)
+                    if "file_count" in backup:
+                        elapsed = backup.get("elapsed_time", 0)
+                        print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path}")
+                        print(f"   サイズ: {size_mb:.2f} MB, ファイル数: {backup['file_count']}")
+                        print(f"   処理: {backup.get('processed', 0)}件, スキップ: {backup.get('skipped', 0)}件, エラー: {backup.get('errors', 0)}件")
+                        print(f"   処理時間: {elapsed:.2f}秒")
+                    else:
+                        print(f"{i}. [{timestamp}] {backup_type}バックアップ - {path} ({size_mb:.2f} MB)")
                 
     elif args.command == 'show-config':
         # 現在の設定を表示
@@ -1255,18 +1363,30 @@ def main():
     
     elif args.command == 'catalog-search':
         # カタログからファイルを検索
-        results = backup_mgr.catalog.find_file_backups(args.pattern)
+        # glob パターン（*）を SQL LIKE パターン（%）に自動変換
+        raw_pattern = args.pattern
+        if "*" in raw_pattern or "?" in raw_pattern:
+            sql_pattern = raw_pattern.replace("%", r"\%").replace("*", "%").replace("?", "_")
+            print(f"ヒント: glob パターン '{raw_pattern}' を SQL パターン '{sql_pattern}' に変換しました")
+        else:
+            sql_pattern = raw_pattern
+        results = backup_mgr.catalog.find_file_backups(sql_pattern)
         if not results:
-            print("該当するファイルが見つかりませんでした")
+            print(f"'{raw_pattern}' に一致するファイルが見つかりませんでした")
+            print("ヒント: ワイルドカードには * (例: *.py) または % (例: %.py) が使えます")
         else:
             print(f"{len(results)} 件のファイルが見つかりました:")
+            print(f"{'ID':>4}  {'日時':<17}  {'種類':^4}  {'サイズ':>8}  ファイルパス")
+            print("-" * 70)
             for r in results:
                 size_kb = r["file_size"] / 1024
                 btype = "完全" if r["backup_type"] == "full" else "差分"
                 print(
-                    f"  [{r['backup_id']}] {r['timestamp']}  ({btype})  "
-                    f"{r['rel_path']}  ({size_kb:.1f} KB)  hash:{r['file_hash'][:8]}..."
+                    f"  [{r['backup_id']:>3}] {r['timestamp']}  ({btype})  "
+                    f"{size_kb:>7.1f}KB  {r['rel_path']}"
                 )
+            print()
+            print("特定ファイルを復元: python SyncVault.py restore-file <ファイルパス> <復元先> --id <ID>")
 
     elif args.command == 'catalog-history':
         # 特定ファイルの履歴を表示
@@ -1285,11 +1405,23 @@ def main():
 
     elif args.command == 'restore-file':
         # ファイル単位の部分復元
-        success = backup_mgr.restore_file(args.rel_path, args.backup_id, args.destination)
+        if args.latest:
+            backup_id = backup_mgr.get_latest_backup_id()
+            if backup_id is None:
+                print("カタログにバックアップが登録されていません。先に run を実行してください")
+                return
+            print(f"最新バックアップ（ID={backup_id}）からファイルを復元します")
+        elif args.id is not None:
+            backup_id = args.id
+        else:
+            print("バックアップを指定してください: --id CATALOG_ID | --latest")
+            print("ヒント: 利用可能な ID は 'python SyncVault.py list' または 'catalog-search' で確認できます")
+            return
+        success = backup_mgr.restore_file(args.rel_path, backup_id, args.destination)
         if success:
             print(f"ファイルを復元しました: {args.destination}")
         else:
-            print("ファイルの復元に失敗しました。ログを確認してください")
+            print("ファイルの復元に失敗しました。ログ（backup.log）を確認してください")
 
     else:
         # コマンドが指定されていない場合はヘルプを表示
