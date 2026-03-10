@@ -19,6 +19,7 @@ import fnmatch
 import hashlib
 import platform
 import time
+import posixpath
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -148,6 +149,178 @@ class PlatformHelper:
     def platform_name() -> str:
         """現在の OS 名を返す。"""
         return _SYSTEM or "Unknown"
+
+class SFTPBackend:
+    """SFTP/SSH バックエンドクラス。paramiko を使用してリモートサーバーへの
+    バックアップ転送・取得を行う。"""
+
+    def __init__(self, sftp_config: dict):
+        self.host = sftp_config["host"]
+        self.port = int(sftp_config.get("port", 22))
+        self.username = sftp_config["username"]
+        self.key_file = os.path.expanduser(sftp_config["key_file"])
+        self.remote_path = sftp_config.get("remote_path", "/")
+        self.known_hosts_file = os.path.expanduser(
+            sftp_config.get("known_hosts_file", "~/.syncvault_known_hosts")
+        )
+        self._ssh = None
+        self._sftp = None
+
+    def _verify_or_register_host_key(self) -> None:
+        """ホスト鍵を検証または初回登録する。
+
+        * 初回接続: ホスト鍵を known_hosts_file に自動登録する
+        * 2回目以降: 保存済み鍵と一致するか検証し、不一致の場合は例外を送出する
+        """
+        import paramiko
+
+        # 認証前にサーバーの公開鍵を取得
+        transport = paramiko.Transport((self.host, self.port))
+        try:
+            transport.start_client(timeout=10)
+            server_key = transport.get_remote_server_key()
+        finally:
+            transport.close()
+
+        known_hosts = paramiko.HostKeys()
+        if os.path.exists(self.known_hosts_file):
+            known_hosts.load(self.known_hosts_file)
+
+        hostname = self.host if self.port == 22 else f"[{self.host}]:{self.port}"
+        existing = known_hosts.lookup(hostname)
+
+        if existing is None:
+            # 初回接続: 鍵を登録して保存
+            known_hosts.add(hostname, server_key.get_name(), server_key)
+            kh_dir = os.path.dirname(os.path.abspath(self.known_hosts_file))
+            os.makedirs(kh_dir, exist_ok=True)
+            known_hosts.save(self.known_hosts_file)
+            PlatformHelper.set_file_permissions(self.known_hosts_file)
+            logger.info(
+                f"ホスト鍵を登録しました: {hostname} ({server_key.get_name()})"
+            )
+        else:
+            # 2回目以降: 保存済み鍵と比較
+            stored_key = existing.get(server_key.get_name())
+            if stored_key is None or stored_key.asbytes() != server_key.asbytes():
+                raise ValueError(
+                    f"ホスト鍵の検証に失敗しました: {hostname}\n"
+                    "中間者攻撃の可能性があります。\n"
+                    f"正当なサーバー変更の場合は {self.known_hosts_file} から"
+                    "該当エントリを削除してください。"
+                )
+            logger.debug(f"ホスト鍵の検証成功: {hostname}")
+
+    def connect(self) -> None:
+        """SFTP サーバーに SSH 鍵認証で接続する。"""
+        import paramiko
+
+        self._verify_or_register_host_key()
+
+        self._ssh = paramiko.SSHClient()
+        self._ssh.load_host_keys(self.known_hosts_file)
+        self._ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        self._ssh.connect(
+            self.host,
+            port=self.port,
+            username=self.username,
+            key_filename=self.key_file,
+            look_for_keys=False,
+            allow_agent=True,
+        )
+        self._sftp = self._ssh.open_sftp()
+        logger.info(f"SFTP接続完了: {self.username}@{self.host}:{self.port}")
+
+    def disconnect(self) -> None:
+        """SFTP 接続を閉じる。"""
+        if self._sftp:
+            self._sftp.close()
+            self._sftp = None
+        if self._ssh:
+            self._ssh.close()
+            self._ssh = None
+        logger.debug("SFTP接続を閉じました")
+
+    def makedirs(self, remote_dir: str) -> None:
+        """リモートディレクトリを再帰的に作成する。"""
+        if not remote_dir or remote_dir == "/":
+            return
+        parent = posixpath.dirname(remote_dir)
+        if parent and parent != remote_dir:
+            self.makedirs(parent)
+        try:
+            self._sftp.stat(remote_dir)
+        except FileNotFoundError:
+            self._sftp.mkdir(remote_dir)
+
+    def upload_file(self, local_path: str, remote_path: str) -> None:
+        """ファイルをアトミックにアップロードする。
+
+        一時ファイル名（remote_path + ".tmp"）でアップロードし、
+        完了後にリネームすることで中断時に不完全ファイルが残らない。
+        """
+        remote_dir = posixpath.dirname(remote_path)
+        if remote_dir:
+            self.makedirs(remote_dir)
+        tmp_path = remote_path + ".tmp"
+        try:
+            self._sftp.put(local_path, tmp_path)
+            try:
+                self._sftp.remove(remote_path)
+            except FileNotFoundError:
+                pass
+            self._sftp.rename(tmp_path, remote_path)
+            logger.debug(f"アップロード完了: {remote_path}")
+        except Exception:
+            try:
+                self._sftp.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    def download_file(self, remote_path: str, local_path: str) -> None:
+        """リモートファイルをローカルにダウンロードする。"""
+        self._sftp.get(remote_path, local_path)
+        logger.debug(f"ダウンロード完了: {remote_path} -> {local_path}")
+
+    def download_dir(self, remote_dir: str, local_dir: str) -> None:
+        """リモートディレクトリをローカルに再帰的にダウンロードする。"""
+        import stat as stat_module
+        os.makedirs(local_dir, exist_ok=True)
+        for attr in self._sftp.listdir_attr(remote_dir):
+            remote_item = posixpath.join(remote_dir, attr.filename)
+            local_item = os.path.join(local_dir, attr.filename)
+            if attr.st_mode and stat_module.S_ISDIR(attr.st_mode):
+                self.download_dir(remote_item, local_item)
+            else:
+                self._sftp.get(remote_item, local_item)
+
+    def list_remote_backups(self, remote_dir: str) -> List[str]:
+        """リモートディレクトリ内のバックアップ一覧を mtime 昇順で返す。
+
+        マニフェストファイル（.manifest.json）と一時ファイル（.tmp）は除外する。
+        """
+        try:
+            attrs = self._sftp.listdir_attr(remote_dir)
+        except FileNotFoundError:
+            return []
+        backups = [
+            a for a in attrs
+            if a.filename.startswith("backup_")
+            and not a.filename.endswith(".tmp")
+            and not a.filename.endswith(".manifest.json")
+        ]
+        backups.sort(key=lambda a: a.st_mtime or 0)
+        return [posixpath.join(remote_dir, a.filename) for a in backups]
+
+    def delete_remote_file(self, remote_path: str) -> None:
+        """リモートファイルを削除する。存在しない場合は警告のみ。"""
+        try:
+            self._sftp.remove(remote_path)
+            logger.info(f"リモートファイルを削除しました: {remote_path}")
+        except FileNotFoundError:
+            logger.warning(f"削除対象のファイルが見つかりません: {remote_path}")
+
 
 class BackupCatalog:
     """SQLiteを使用してバックアップカタログを管理するクラス"""
@@ -338,6 +511,11 @@ class BackupCatalog:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_backup(self, backup_id: int) -> None:
+        """バックアップをカタログから削除する（関連ファイルも CASCADE 削除）。"""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
+
 
 class FileProcessor:
     """ファイル処理用のヘルパークラス"""
@@ -397,6 +575,16 @@ class BackupManager:
             default_config = {
                 "sources": [],
                 "destination": "",
+                "destination_type": "local",  # "local" または "sftp"
+                "sftp": {
+                    "host": "",
+                    "port": 22,
+                    "username": "",
+                    "key_file": "",
+                    "remote_path": "",
+                    "known_hosts_file": "~/.syncvault_known_hosts",
+                    "max_generations": 0,
+                },
                 "backup_type": "full",  # full または differential
                 "compress": True,
                 "compression_format": PlatformHelper.get_default_compression_format(),
@@ -430,6 +618,14 @@ class BackupManager:
                     config["exclude_patterns"] = PlatformHelper.get_default_exclude_patterns()
                 if "compression_format" not in config:
                     config["compression_format"] = PlatformHelper.get_default_compression_format()
+                if "destination_type" not in config:
+                    config["destination_type"] = "local"
+                if "sftp" not in config:
+                    config["sftp"] = {
+                        "host": "", "port": 22, "username": "", "key_file": "",
+                        "remote_path": "", "known_hosts_file": "~/.syncvault_known_hosts",
+                        "max_generations": 0,
+                    }
                 return config
         except json.JSONDecodeError:
             logger.error("設定ファイルの形式が不正です")
@@ -695,20 +891,48 @@ class BackupManager:
             return None
     
     def _get_last_backup_manifest(self) -> Dict[str, str]:
-        """最後のバックアップのマニフェストを取得する
-        
+        """最後のバックアップのマニフェストを取得する。
+
+        SFTP バックアップの場合はリモートからダウンロードして読み込む。
+
         Returns:
             ファイルパスとハッシュ値の辞書
         """
         if not self.config["history"]:
             return {}
-            
+
         last_backup = self.config["history"][-1]
         manifest_path = last_backup.get("manifest_path")
-        
-        if not manifest_path or not os.path.exists(manifest_path):
+
+        if not manifest_path:
             return {}
-            
+
+        # SFTP からマニフェストを取得
+        if manifest_path.startswith("sftp://"):
+            tmp_manifest = None
+            backend = self._get_sftp_backend()
+            try:
+                backend.connect()
+                remote_manifest = self._parse_sftp_remote_path(manifest_path)
+                tmp_manifest = tempfile.mktemp(suffix=".manifest.json")
+                backend.download_file(remote_manifest, tmp_manifest)
+                with open(tmp_manifest, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"SFTP からマニフェストを取得できませんでした: {e}")
+                return {}
+            finally:
+                backend.disconnect()
+                if tmp_manifest and os.path.exists(tmp_manifest):
+                    try:
+                        os.remove(tmp_manifest)
+                    except OSError:
+                        pass
+
+        # ローカルマニフェスト
+        if not os.path.exists(manifest_path):
+            return {}
+
         try:
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -738,7 +962,7 @@ class BackupManager:
     
     def _compress_directory(self, source_dir: str, output_path: str) -> None:
         """ディレクトリを圧縮する
-        
+
         Args:
             source_dir: 圧縮元ディレクトリ
             output_path: 出力ファイルパス
@@ -753,7 +977,161 @@ class BackupManager:
         else:  # tar.gz
             with tarfile.open(output_path, "w:gz") as tar:
                 tar.add(source_dir, arcname=os.path.basename(source_dir))
-    
+
+    # -----------------------------------------------------------------------
+    # SFTP ヘルパーメソッド
+    # -----------------------------------------------------------------------
+
+    def _get_sftp_backend(self) -> SFTPBackend:
+        """設定から SFTPBackend インスタンスを生成する。"""
+        return SFTPBackend(self.config.get("sftp", {}))
+
+    def _make_sftp_url(self, remote_path: str) -> str:
+        """リモートパスから sftp://host:port/path 形式の URL を生成する。"""
+        sftp_cfg = self.config["sftp"]
+        host = sftp_cfg["host"]
+        port = sftp_cfg.get("port", 22)
+        return f"sftp://{host}:{port}{remote_path}"
+
+    def _parse_sftp_remote_path(self, sftp_url: str) -> str:
+        """sftp://host:port/path から /path 部分を抽出する。"""
+        without_scheme = sftp_url[len("sftp://"):]
+        slash_idx = without_scheme.find("/")
+        if slash_idx == -1:
+            return "/"
+        return without_scheme[slash_idx:]
+
+    def set_sftp_destination(
+        self,
+        host: str,
+        username: str,
+        key_file: str,
+        remote_path: str,
+        port: int = 22,
+        max_generations: int = 0,
+    ) -> None:
+        """SFTP バックアップ先を設定する。
+
+        Args:
+            host: SFTP サーバーのホスト名または IP アドレス
+            username: SSH ログインユーザー名
+            key_file: SSH 秘密鍵ファイルのパス
+            remote_path: リモートサーバー上のバックアップ保存ディレクトリ
+            port: SSH ポート番号（デフォルト 22）
+            max_generations: 保持する世代数（0 = 無制限）
+        """
+        key_file_expanded = os.path.expanduser(key_file)
+        if not os.path.exists(key_file_expanded):
+            logger.error(f"SSH 鍵ファイルが見つかりません: {key_file}")
+            return
+        self.config["destination_type"] = "sftp"
+        self.config["sftp"] = {
+            "host": host,
+            "port": port,
+            "username": username,
+            "key_file": key_file,
+            "remote_path": remote_path,
+            "known_hosts_file": "~/.syncvault_known_hosts",
+            "max_generations": max_generations,
+        }
+        self._save_config()
+        logger.info(
+            f"SFTP バックアップ先を設定しました: {username}@{host}:{port}{remote_path}"
+        )
+
+    def test_sftp_connection(self) -> bool:
+        """SFTP 接続と書き込み権限をテストする。
+
+        Returns:
+            接続成功の場合は True
+        """
+        if self.config.get("destination_type") != "sftp":
+            logger.error(
+                "SFTP が設定されていません。set-sftp-destination を実行してください"
+            )
+            return False
+        backend = self._get_sftp_backend()
+        try:
+            backend.connect()
+            sftp_cfg = self.config["sftp"]
+            backend.makedirs(sftp_cfg["remote_path"])
+            logger.info(
+                f"SFTP 接続テスト成功: "
+                f"{sftp_cfg['username']}@{sftp_cfg['host']}:{sftp_cfg.get('port', 22)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"SFTP 接続テストに失敗しました: {e}")
+            return False
+        finally:
+            backend.disconnect()
+
+    def _prune_remote_generations(self, backend: SFTPBackend) -> None:
+        """世代数を超えた古いリモートバックアップを削除する。
+
+        max_generations が 0 以下の場合は何もしない。
+        最新バックアップがカタログに登録済みの状態で呼び出すこと。
+        """
+        sftp_cfg = self.config.get("sftp", {})
+        max_gen = sftp_cfg.get("max_generations", 0)
+        if not max_gen or max_gen <= 0:
+            return
+
+        remote_dir = sftp_cfg["remote_path"]
+        remote_backups = backend.list_remote_backups(remote_dir)
+        excess_count = len(remote_backups) - max_gen
+        if excess_count <= 0:
+            return
+
+        all_catalog_backups = self.catalog.list_backups()
+        for remote_file in remote_backups[:excess_count]:
+            # バックアップ本体を削除
+            backend.delete_remote_file(remote_file)
+            # マニフェストファイルも削除
+            backend.delete_remote_file(remote_file + ".manifest.json")
+
+            # カタログから削除
+            sftp_url = self._make_sftp_url(remote_file)
+            for b in all_catalog_backups:
+                if b["backup_path"] == sftp_url:
+                    self.catalog.delete_backup(b["id"])
+                    break
+
+            # config 履歴からも削除
+            self.config["history"] = [
+                h for h in self.config.get("history", [])
+                if h.get("path") != sftp_url
+            ]
+
+        logger.info(f"{excess_count} 件の古いバックアップを削除しました")
+        self._save_config()
+
+    def _download_sftp_to_temp(self, sftp_url: str) -> Tuple[str, str]:
+        """SFTP バックアップをローカル一時ディレクトリにダウンロードする。
+
+        Returns:
+            (local_path, tmp_dir) のタプル。
+            tmp_dir は呼び出し元が shutil.rmtree で削除する責任を持つ。
+        """
+        remote_path = self._parse_sftp_remote_path(sftp_url)
+        tmp_dir = tempfile.mkdtemp(prefix="syncvault_restore_")
+        local_filename = posixpath.basename(remote_path)
+        local_path = os.path.join(tmp_dir, local_filename)
+
+        backend = self._get_sftp_backend()
+        backend.connect()
+        try:
+            is_archive = sftp_url.endswith(".zip") or sftp_url.endswith(".tar.gz")
+            if is_archive:
+                backend.download_file(remote_path, local_path)
+            else:
+                backend.download_dir(remote_path, local_path)
+            logger.info(f"バックアップをダウンロードしました: {sftp_url}")
+        finally:
+            backend.disconnect()
+
+        return local_path, tmp_dir
+
     def run_backup(self) -> bool:
         """バックアップを実行する（並列処理版）
         
@@ -763,8 +1141,16 @@ class BackupManager:
         if not self.config["sources"]:
             logger.error("バックアップ元が設定されていません")
             return False
-            
-        if not self.config["destination"]:
+
+        destination_type = self.config.get("destination_type", "local")
+        if destination_type == "sftp":
+            sftp_cfg = self.config.get("sftp", {})
+            if not sftp_cfg.get("host") or not sftp_cfg.get("username") or not sftp_cfg.get("key_file"):
+                logger.error(
+                    "SFTP接続先が設定されていません。set-sftp-destination を実行してください"
+                )
+                return False
+        elif not self.config["destination"]:
             logger.error("バックアップ先が設定されていません")
             return False
             
@@ -868,48 +1254,124 @@ class BackupManager:
 
             # バックアップ先のファイル名
             backup_filename = self._create_backup_filename(is_full_backup)
-            backup_path = os.path.join(self.config["destination"], backup_filename)
+            destination_type = self.config.get("destination_type", "local")
 
-            # 圧縮するかどうかで処理を分岐
-            if self.config["compress"]:
-                logger.info("バックアップを圧縮中...")
-                self._compress_directory(temp_dir, backup_path)
-                logger.info(f"バックアップを圧縮しました: {backup_path}")
-                # 圧縮後もマニフェストをバックアップ先に保存する
-                manifest_path = backup_path + ".manifest.json"
-                shutil.copy2(manifest_tmp_path, manifest_path)
+            if destination_type == "sftp":
+                # ---- SFTP アップロード ----
+                sftp_config = self.config["sftp"]
+                remote_base = sftp_config["remote_path"]
+                backend = self._get_sftp_backend()
+                backend.connect()
+                try:
+                    if self.config["compress"]:
+                        # ローカルに一時アーカイブを作成してアップロード
+                        local_archive = os.path.join(
+                            tempfile.gettempdir(), backup_filename
+                        )
+                        try:
+                            logger.info("バックアップを圧縮中...")
+                            self._compress_directory(temp_dir, local_archive)
+                            remote_archive = posixpath.join(remote_base, backup_filename)
+                            remote_manifest_sftp = remote_archive + ".manifest.json"
+                            backend.upload_file(local_archive, remote_archive)
+                            backend.upload_file(manifest_tmp_path, remote_manifest_sftp)
+                            logger.info(
+                                f"バックアップをアップロードしました: {remote_archive}"
+                            )
+                        finally:
+                            if os.path.exists(local_archive):
+                                os.remove(local_archive)
+                    else:
+                        # ディレクトリツリーをそのままアップロード
+                        remote_archive = posixpath.join(remote_base, backup_filename)
+                        remote_manifest_sftp = posixpath.join(
+                            remote_archive, "manifest.json"
+                        )
+                        backend.makedirs(remote_archive)
+                        for root, _dirs, fnames in os.walk(temp_dir):
+                            for fname in fnames:
+                                local_fp = os.path.join(root, fname)
+                                rel = os.path.relpath(
+                                    local_fp, temp_dir
+                                ).replace("\\", "/")
+                                backend.upload_file(
+                                    local_fp, posixpath.join(remote_archive, rel)
+                                )
+                        logger.info(
+                            f"バックアップをアップロードしました: {remote_archive}"
+                        )
+
+                    backup_path = self._make_sftp_url(remote_archive)
+                    manifest_path = self._make_sftp_url(remote_manifest_sftp)
+                    backup_size = 0
+
+                    # 履歴とカタログに登録（世代管理の前に実施）
+                    backup_record = {
+                        "timestamp": timestamp,
+                        "type": "full" if is_full_backup else "differential",
+                        "path": backup_path,
+                        "manifest_path": manifest_path,
+                        "size": backup_size,
+                        "file_count": len(manifest),
+                        "processed": stats["processed"],
+                        "skipped": stats["skipped"],
+                        "errors": stats["errors"],
+                        "elapsed_time": elapsed_time,
+                    }
+                    self.config["history"].append(backup_record)
+                    self._save_config()
+                    try:
+                        self.catalog.register_backup(
+                            backup_record, manifest, file_sizes, source_paths
+                        )
+                        logger.info("バックアップカタログを更新しました")
+                    except Exception as e:
+                        logger.warning(
+                            f"カタログ更新に失敗しました（バックアップ自体は成功）: {e}"
+                        )
+
+                    # 世代管理（最新バックアップ登録後に実施）
+                    self._prune_remote_generations(backend)
+                finally:
+                    backend.disconnect()
             else:
-                # 圧縮なしの場合はディレクトリごとコピー
-                shutil.copytree(temp_dir, backup_path)
-                logger.info(f"バックアップを作成しました: {backup_path}")
-                # マニフェストはコピー先ディレクトリ内に存在する
-                manifest_path = os.path.join(backup_path, "manifest.json")
-            
-            # 履歴に追加
-            backup_record = {
-                "timestamp": timestamp,
-                "type": "full" if is_full_backup else "differential",
-                "path": backup_path,
-                "manifest_path": manifest_path,
-                "size": os.path.getsize(backup_path) if os.path.exists(backup_path) else 0,
-                "file_count": len(manifest),
-                "processed": stats["processed"],
-                "skipped": stats["skipped"],
-                "errors": stats["errors"],
-                "elapsed_time": elapsed_time
-            }
-            
-            self.config["history"].append(backup_record)
-            self._save_config()
+                # ---- ローカルファイルシステム ----
+                backup_path = os.path.join(self.config["destination"], backup_filename)
 
-            # SQLite カタログにバックアップとファイル一覧を登録
-            try:
-                self.catalog.register_backup(
-                    backup_record, manifest, file_sizes, source_paths
-                )
-                logger.info("バックアップカタログを更新しました")
-            except Exception as e:
-                logger.warning(f"カタログ更新に失敗しました（バックアップ自体は成功）: {e}")
+                if self.config["compress"]:
+                    logger.info("バックアップを圧縮中...")
+                    self._compress_directory(temp_dir, backup_path)
+                    logger.info(f"バックアップを圧縮しました: {backup_path}")
+                    manifest_path = backup_path + ".manifest.json"
+                    shutil.copy2(manifest_tmp_path, manifest_path)
+                else:
+                    shutil.copytree(temp_dir, backup_path)
+                    logger.info(f"バックアップを作成しました: {backup_path}")
+                    manifest_path = os.path.join(backup_path, "manifest.json")
+
+                backup_record = {
+                    "timestamp": timestamp,
+                    "type": "full" if is_full_backup else "differential",
+                    "path": backup_path,
+                    "manifest_path": manifest_path,
+                    "size": os.path.getsize(backup_path) if os.path.exists(backup_path) else 0,
+                    "file_count": len(manifest),
+                    "processed": stats["processed"],
+                    "skipped": stats["skipped"],
+                    "errors": stats["errors"],
+                    "elapsed_time": elapsed_time,
+                }
+                self.config["history"].append(backup_record)
+                self._save_config()
+                try:
+                    self.catalog.register_backup(
+                        backup_record, manifest, file_sizes, source_paths
+                    )
+                    logger.info("バックアップカタログを更新しました")
+                except Exception as e:
+                    logger.warning(
+                        f"カタログ更新に失敗しました（バックアップ自体は成功）: {e}"
+                    )
 
             return True
             
@@ -928,15 +1390,32 @@ class BackupManager:
 
         Args:
             backup_path: 復元するバックアップファイルまたはディレクトリのパス
+                         sftp://host:port/path 形式の SFTP URL も指定可能
             restore_path: 復元先ディレクトリのパス
             dry_run: True の場合は実際のコピーを行わず、復元対象ファイルを表示するのみ
 
         Returns:
             復元が成功した場合は True
         """
-        if not os.path.exists(backup_path):
-            logger.error(f"バックアップファイルが見つかりません: {backup_path}")
-            return False
+        tmp_dir = None
+        if backup_path.startswith("sftp://"):
+            if dry_run:
+                print(f"[ドライラン] SFTP からバックアップをダウンロードします: {backup_path}")
+            try:
+                backup_path, tmp_dir = self._download_sftp_to_temp(backup_path)
+            except Exception as e:
+                logger.error(f"SFTP からのダウンロードに失敗しました: {e}")
+                return False
+
+        try:
+            if not os.path.exists(backup_path):
+                logger.error(f"バックアップファイルが見つかりません: {backup_path}")
+                return False
+
+        except Exception:
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            raise
 
         try:
             if dry_run:
@@ -985,6 +1464,9 @@ class BackupManager:
         except Exception as e:
             logger.error(f"バックアップの復元に失敗しました: {str(e)}")
             return False
+        finally:
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
 
     def get_latest_backup_id(self) -> Optional[int]:
         """カタログに登録された最新バックアップの ID を返す。
@@ -1016,8 +1498,19 @@ class BackupManager:
             return False
 
         backup_path = target_backup["backup_path"]
+
+        tmp_dir = None
+        if backup_path.startswith("sftp://"):
+            try:
+                backup_path, tmp_dir = self._download_sftp_to_temp(backup_path)
+            except Exception as e:
+                logger.error(f"SFTP からのダウンロードに失敗しました: {e}")
+                return False
+
         if not os.path.exists(backup_path):
             logger.error(f"バックアップファイルが見つかりません: {backup_path}")
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
             return False
 
         os.makedirs(restore_path, exist_ok=True)
@@ -1068,6 +1561,9 @@ class BackupManager:
         except Exception as e:
             logger.error(f"ファイル復元に失敗しました: {e}")
             return False
+        finally:
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
 
     def list_backups(self) -> List[Dict[str, Any]]:
         """バックアップの履歴を取得する
@@ -1172,6 +1668,23 @@ def create_parser() -> argparse.ArgumentParser:
                                        help='バックアップ ID（catalog-search / list で確認）')
     restore_file_id_group.add_argument('--latest', action='store_true',
                                        help='最新バックアップからファイルを復元する')
+
+    # SFTP バックアップ先設定コマンド
+    set_sftp_parser = subparsers.add_parser(
+        'set-sftp-destination',
+        help='SFTP/SSH バックアップ先を設定する',
+    )
+    set_sftp_parser.add_argument('--host', required=True, help='SFTP サーバーのホスト名または IP')
+    set_sftp_parser.add_argument('--user', required=True, help='SSH ログインユーザー名')
+    set_sftp_parser.add_argument('--key-file', required=True, help='SSH 秘密鍵ファイルのパス')
+    set_sftp_parser.add_argument('--remote-path', required=True,
+                                 help='リモートサーバー上のバックアップ保存ディレクトリ')
+    set_sftp_parser.add_argument('--port', type=int, default=22, help='SSH ポート番号（デフォルト: 22）')
+    set_sftp_parser.add_argument('--max-generations', type=int, default=0,
+                                 help='保持する世代数（0 = 無制限、デフォルト: 0）')
+
+    # SFTP 接続テストコマンド
+    subparsers.add_parser('test-connection', help='SFTP 接続をテストする')
 
     return parser
 
@@ -1336,7 +1849,16 @@ def main():
         print(f"一時ディレクトリ: {tempfile.gettempdir()}")
         print()
         print(f"バックアップ元: {', '.join(config['sources'])}" if config['sources'] else "バックアップ元: 未設定")
-        print(f"バックアップ先: {config['destination']}" if config['destination'] else "バックアップ先: 未設定")
+        dest_type = config.get("destination_type", "local")
+        if dest_type == "sftp":
+            sftp = config.get("sftp", {})
+            print(f"バックアップ先: sftp://{sftp.get('username', '')}@{sftp.get('host', '')}:{sftp.get('port', 22)}{sftp.get('remote_path', '')}")
+            print(f"  認証鍵      : {sftp.get('key_file', '未設定')}")
+            print(f"  known_hosts : {sftp.get('known_hosts_file', '~/.syncvault_known_hosts')}")
+            gen = sftp.get("max_generations", 0)
+            print(f"  世代管理    : {'無制限' if not gen else f'{gen} 世代'}")
+        else:
+            print(f"バックアップ先: {config['destination']}" if config['destination'] else "バックアップ先: 未設定")
         print(f"バックアップの種類: {'完全' if config['backup_type'] == 'full' else '差分'}")
         print(f"圧縮: {'有効' if config['compress'] else '無効'}")
         if config['compress']:
@@ -1422,6 +1944,35 @@ def main():
             print(f"ファイルを復元しました: {args.destination}")
         else:
             print("ファイルの復元に失敗しました。ログ（backup.log）を確認してください")
+
+    elif args.command == 'set-sftp-destination':
+        # SFTP バックアップ先を設定
+        backup_mgr.set_sftp_destination(
+            host=args.host,
+            username=args.user,
+            key_file=args.key_file,
+            remote_path=args.remote_path,
+            port=args.port,
+            max_generations=args.max_generations,
+        )
+        sftp = backup_mgr.config.get("sftp", {})
+        print(f"SFTP バックアップ先を設定しました:")
+        print(f"  ホスト    : {sftp['host']}:{sftp.get('port', 22)}")
+        print(f"  ユーザー  : {sftp['username']}")
+        print(f"  鍵ファイル: {sftp['key_file']}")
+        print(f"  リモートパス: {sftp['remote_path']}")
+        gen = sftp.get('max_generations', 0)
+        print(f"  世代管理  : {'無制限' if not gen else f'{gen} 世代'}")
+        print("接続テスト: python SyncVault.py test-connection")
+
+    elif args.command == 'test-connection':
+        # SFTP 接続テスト
+        print("SFTP 接続をテストしています...")
+        success = backup_mgr.test_sftp_connection()
+        if success:
+            print("接続テスト成功")
+        else:
+            print("接続テストに失敗しました。ログ（backup.log）を確認してください")
 
     else:
         # コマンドが指定されていない場合はヘルプを表示
