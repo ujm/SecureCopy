@@ -15,6 +15,7 @@ import datetime
 import json
 import tarfile
 import zipfile
+import fnmatch
 import hashlib
 import platform
 import time
@@ -324,11 +325,7 @@ class BackupManager:
         """
         filename = os.path.basename(filepath)
         for pattern in self.config.get("exclude_patterns", []):
-            if pattern.startswith("*") and filename.endswith(pattern[1:]):
-                return True
-            elif pattern.endswith("*") and filename.startswith(pattern[:-1]):
-                return True
-            elif pattern == filename:
+            if fnmatch.fnmatch(filename, pattern):
                 return True
         return False
     
@@ -569,31 +566,36 @@ class BackupManager:
                 logger.warning("バックアップするファイルがありません（すべてスキップまたはエラー）")
                 return False
             
-            # マニフェストファイルを作成
-            manifest_path = os.path.join(temp_dir, "manifest.json")
-            with open(manifest_path, 'w', encoding='utf-8') as f:
+            # マニフェストファイルを一時ディレクトリに作成
+            manifest_tmp_path = os.path.join(temp_dir, "manifest.json")
+            with open(manifest_tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(manifest, f, indent=4)
-                
+
             # バックアップ先のファイル名
             backup_filename = self._create_backup_filename(is_full_backup)
             backup_path = os.path.join(self.config["destination"], backup_filename)
-            
+
             # 圧縮するかどうかで処理を分岐
             if self.config["compress"]:
                 logger.info("バックアップを圧縮中...")
                 self._compress_directory(temp_dir, backup_path)
                 logger.info(f"バックアップを圧縮しました: {backup_path}")
+                # 圧縮後もマニフェストをバックアップ先に保存する
+                manifest_path = backup_path + ".manifest.json"
+                shutil.copy2(manifest_tmp_path, manifest_path)
             else:
                 # 圧縮なしの場合はディレクトリごとコピー
                 shutil.copytree(temp_dir, backup_path)
                 logger.info(f"バックアップを作成しました: {backup_path}")
+                # マニフェストはコピー先ディレクトリ内に存在する
+                manifest_path = os.path.join(backup_path, "manifest.json")
             
             # 履歴に追加
             backup_record = {
                 "timestamp": timestamp,
                 "type": "full" if is_full_backup else "differential",
                 "path": backup_path,
-                "manifest_path": manifest_path if not self.config["compress"] else None,
+                "manifest_path": manifest_path,
                 "size": os.path.getsize(backup_path) if os.path.exists(backup_path) else 0,
                 "file_count": len(manifest),
                 "processed": stats["processed"],
@@ -612,8 +614,8 @@ class BackupManager:
             return False
             
         finally:
-            # 一時ディレクトリを削除
-            if os.path.exists(temp_dir) and self.config["compress"]:
+            # 一時ディレクトリを削除（圧縮の有無にかかわらず常に削除）
+            if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
     def restore_backup(self, backup_path: str, restore_path: str) -> bool:
