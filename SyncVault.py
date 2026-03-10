@@ -20,6 +20,7 @@ import hashlib
 import platform
 import time
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,26 +35,119 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
-# ロギング設定
+# -----------------------------------------------------------------------
+# プラットフォーム検出
+# -----------------------------------------------------------------------
+_SYSTEM = platform.system()   # "Windows" / "Linux" / "Darwin" など
+IS_WINDOWS = _SYSTEM == "Windows"
+IS_LINUX   = _SYSTEM == "Linux"
+
+
+def _get_app_data_dir() -> str:
+    """OS ごとのアプリケーションデータ格納ディレクトリを返す。
+
+    * Windows: %APPDATA%\\SyncVault
+    * Linux / その他: $HOME
+    """
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        app_dir = os.path.join(base, "SyncVault")
+        os.makedirs(app_dir, exist_ok=True)
+        return app_dir
+    else:
+        return os.path.expanduser("~")
+
+
+_APP_DATA_DIR = _get_app_data_dir()
+
+# -----------------------------------------------------------------------
+# ロギング設定（ログファイルをプラットフォーム対応パスに）
+# -----------------------------------------------------------------------
+_LOG_PATH = os.path.join(_APP_DATA_DIR, "backup.log") if IS_WINDOWS else "backup.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("backup.log"),
+        logging.FileHandler(_LOG_PATH),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("backup")
 
-# 設定ファイルのデフォルトパス
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.backup_config.json")
+# -----------------------------------------------------------------------
+# デフォルトパス（プラットフォーム別）
+# -----------------------------------------------------------------------
+# Windows : %APPDATA%\SyncVault\config.json
+# Linux   : ~/.backup_config.json
+DEFAULT_CONFIG_PATH = (
+    os.path.join(_APP_DATA_DIR, "config.json")
+    if IS_WINDOWS
+    else os.path.expanduser("~/.backup_config.json")
+)
 
-# カタログDBのデフォルトパス
-DEFAULT_CATALOG_PATH = os.path.expanduser("~/.backup_catalog.db")
+# Windows : %APPDATA%\SyncVault\catalog.db
+# Linux   : ~/.backup_catalog.db
+DEFAULT_CATALOG_PATH = (
+    os.path.join(_APP_DATA_DIR, "catalog.db")
+    if IS_WINDOWS
+    else os.path.expanduser("~/.backup_catalog.db")
+)
 
 # 並列処理の設定
 DEFAULT_MAX_WORKERS = min(32, (os.cpu_count() or 1) * 2)
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+
+
+# -----------------------------------------------------------------------
+# プラットフォームヘルパー
+# -----------------------------------------------------------------------
+class PlatformHelper:
+    """プラットフォーム固有の挙動を集約するユーティリティクラス。"""
+
+    @staticmethod
+    def get_default_compression_format() -> str:
+        """デフォルト圧縮形式を返す。
+
+        * Windows: zip（標準エクスプローラーで開ける）
+        * Linux  : tar.gz（Unix 系ツールとの親和性が高い）
+        """
+        return "zip" if IS_WINDOWS else "tar.gz"
+
+    @staticmethod
+    def get_default_exclude_patterns() -> List[str]:
+        """OS ごとの不要ファイル除外パターンを返す。"""
+        common = ["*.tmp", "*.temp", "~*"]
+        if IS_WINDOWS:
+            return common + ["Thumbs.db", "desktop.ini", "*.lnk"]
+        else:
+            return common + [".DS_Store", "*.swp", "*.swo"]
+
+    @staticmethod
+    def normalize_archive_path(path: str) -> str:
+        """アーカイブ内エントリのパスを常に '/' 区切りに正規化する。
+
+        ZIP / tar.gz は内部的に '/' を使うため、Windows 環境で生成した
+        バックスラッシュ区切りのパスを変換する。
+        """
+        return path.replace("\\", "/")
+
+    @staticmethod
+    def set_file_permissions(filepath: str, mode: int = 0o600) -> None:
+        """ファイルのパーミッションを設定する（Linux / macOS のみ有効）。
+
+        Windows では chmod の概念が異なるためスキップする。
+        """
+        if not IS_WINDOWS:
+            try:
+                os.chmod(filepath, mode)
+            except OSError as e:
+                logger.debug(f"パーミッション設定をスキップしました: {filepath} - {e}")
+
+    @staticmethod
+    def platform_name() -> str:
+        """現在の OS 名を返す。"""
+        return _SYSTEM or "Unknown"
 
 class BackupCatalog:
     """SQLiteを使用してバックアップカタログを管理するクラス"""
@@ -299,13 +393,13 @@ class BackupManager:
             設定データを含む辞書
         """
         if not os.path.exists(self.config_path):
-            # デフォルト設定
+            # デフォルト設定（プラットフォームに応じて自動調整）
             default_config = {
                 "sources": [],
                 "destination": "",
                 "backup_type": "full",  # full または differential
                 "compress": True,
-                "compression_format": "zip",  # zip または tar.gz
+                "compression_format": PlatformHelper.get_default_compression_format(),
                 "schedule": {
                     "type": "daily",  # daily, weekly, monthly
                     "time": "00:00",
@@ -314,19 +408,15 @@ class BackupManager:
                 },
                 "history": [],
                 "max_workers": DEFAULT_MAX_WORKERS,  # 並列処理の最大ワーカー数
-                "exclude_patterns": [  # 除外パターン
-                    "*.tmp",
-                    "*.temp",
-                    "~*",
-                    "Thumbs.db",
-                    ".DS_Store"
-                ]
+                "exclude_patterns": PlatformHelper.get_default_exclude_patterns(),
             }
-            
+
             # デフォルト設定を保存
             with open(self.config_path, 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, indent=4)
-                
+            # Linux では設定ファイルのパーミッションを制限する
+            PlatformHelper.set_file_permissions(self.config_path)
+
             return default_config
         
         # 既存の設定ファイルを読み込む
@@ -337,7 +427,9 @@ class BackupManager:
                 if "max_workers" not in config:
                     config["max_workers"] = DEFAULT_MAX_WORKERS
                 if "exclude_patterns" not in config:
-                    config["exclude_patterns"] = ["*.tmp", "*.temp", "~*", "Thumbs.db", ".DS_Store"]
+                    config["exclude_patterns"] = PlatformHelper.get_default_exclude_patterns()
+                if "compression_format" not in config:
+                    config["compression_format"] = PlatformHelper.get_default_compression_format()
                 return config
         except json.JSONDecodeError:
             logger.error("設定ファイルの形式が不正です")
@@ -683,8 +775,9 @@ class BackupManager:
         logger.info(f"並列処理ワーカー数: {self.max_workers}")
         
         # 一時ディレクトリを作成
+        # OS 標準の一時領域（Windows: %TEMP%, Linux: /tmp など）を使用する
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_dir = os.path.join(os.path.expanduser("~"), f".backup_temp_{timestamp}")
+        temp_dir = os.path.join(tempfile.gettempdir(), f"syncvault_temp_{timestamp}")
         os.makedirs(temp_dir, exist_ok=True)
         
         try:
@@ -908,8 +1001,8 @@ class BackupManager:
 
             elif backup_path.endswith(".zip"):
                 with zipfile.ZipFile(backup_path, "r") as zipf:
-                    # ZIP 内のパス区切りを正規化
-                    zip_path = rel_path.replace(os.sep, "/")
+                    # ZIP 内のパス区切りは常に '/' なので正規化する
+                    zip_path = PlatformHelper.normalize_archive_path(rel_path)
                     if zip_path not in zipf.namelist():
                         logger.error(f"ZIP 内にファイルが見つかりません: {zip_path}")
                         return False
@@ -919,10 +1012,11 @@ class BackupManager:
             elif backup_path.endswith(".tar.gz"):
                 with tarfile.open(backup_path, "r:gz") as tar:
                     # tar 内のパスはアーカイブ名のプレフィックスが付く場合がある
+                    # Windows バックスラッシュを '/' に正規化して比較する
                     members = tar.getnames()
-                    # rel_path に一致するメンバーを探す
+                    norm_rel = PlatformHelper.normalize_archive_path(rel_path)
                     match = next(
-                        (m for m in members if m == rel_path or m.endswith("/" + rel_path)),
+                        (m for m in members if m == norm_rel or m.endswith("/" + norm_rel)),
                         None,
                     )
                     if match is None:
@@ -1127,28 +1221,34 @@ def main():
         # 現在の設定を表示
         config = backup_mgr.config
         print("現在の設定:")
+        # --- プラットフォーム情報 ---
+        print(f"動作 OS  : {PlatformHelper.platform_name()}")
+        print(f"設定ファイル: {backup_mgr.config_path}")
+        print(f"ログファイル: {_LOG_PATH}")
+        print(f"一時ディレクトリ: {tempfile.gettempdir()}")
+        print()
         print(f"バックアップ元: {', '.join(config['sources'])}" if config['sources'] else "バックアップ元: 未設定")
         print(f"バックアップ先: {config['destination']}" if config['destination'] else "バックアップ先: 未設定")
         print(f"バックアップの種類: {'完全' if config['backup_type'] == 'full' else '差分'}")
         print(f"圧縮: {'有効' if config['compress'] else '無効'}")
         if config['compress']:
             print(f"圧縮形式: {config['compression_format']}")
-        
+
         print(f"並列処理ワーカー数: {config.get('max_workers', DEFAULT_MAX_WORKERS)}")
-        
+
         if config.get('exclude_patterns'):
             print(f"除外パターン: {', '.join(config['exclude_patterns'])}")
-        
+
         schedule = config['schedule']
         schedule_types = {"daily": "毎日", "weekly": "毎週", "monthly": "毎月"}
         print(f"スケジュール: {schedule_types.get(schedule['type'], schedule['type'])}")
         print(f"実行時刻: {schedule['time']}")
-        
+
         if schedule['type'] in ["weekly", "monthly"]:
             weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
             day = schedule['day_of_week']
             print(f"実行曜日: {weekdays[day]}")
-            
+
         full_day = schedule['full_backup_day']
         weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
         print(f"完全バックアップ実行曜日: {weekdays[full_day]}")
